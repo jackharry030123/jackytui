@@ -2,6 +2,11 @@ name: RDP + Call Operator Fix + VRDP
 
 on:
   workflow_dispatch:
+    inputs:
+      tailscale_key:
+        description: 'Tailscale auth key (reusable). Leave blank to use local .env or env var on runner.'
+        required: false
+        default: ''
 
 jobs:
   setup-rdp-and-vm:
@@ -52,20 +57,53 @@ jobs:
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
+        env:
+          TS_AUTH_KEY: ${{ github.event.inputs.tailscale_key }}  # from workflow input
         run: |
-          $authKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$authKey --hostname=gh-runner-$env:GITHUB_RUN_ID
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
+          $tsPath = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          # fallback: allow TS_AUTH_KEY passed via env on runner or local .env file
+          if (-not $env:TS_AUTH_KEY) {
+              $envFile = "$env:GITHUB_WORKSPACE\.env"
+              if (Test-Path $envFile) {
+                  Write-Host "Reading .env fallback for TS_AUTH_KEY"
+                  $lines = Get-Content $envFile
+                  foreach ($l in $lines) {
+                      if ($l -match '^\s*TS_AUTH_KEY\s*=\s*(.+)\s*$') {
+                          $env:TS_AUTH_KEY = $matches[1].Trim()
+                          break
+                      }
+                  }
+              }
           }
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+
+          if (-not $env:TS_AUTH_KEY) {
+              Write-Error "No Tailscale auth key provided. Supply as workflow input or set TS_AUTH_KEY in runner environment or .env file (not committed)."
               exit 1
           }
+
+          $authKey = $env:TS_AUTH_KEY
+          # Mask show
+          Write-Host "Using tailscale key with prefix:" + $authKey.Substring(0,5) + "..."
+          & $tsPath up --authkey=$authKey --hostname="gh-runner-$env:GITHUB_RUN_ID" --unattended
+
+          # Wait for IP assignment
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 20) {
+              $tsIP = & $tsPath ip -4
+              if ($tsIP) { break }
+              Write-Host "Waiting for Tailscale IP... ($retries/20)"
+              Start-Sleep -Seconds 3
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. If this fails, generate a NEW Reusable key."
+              exit 1
+          }
+          
+          Write-Host "Tailscale Connected! IP: $tsIP"
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
       # ==========================================
